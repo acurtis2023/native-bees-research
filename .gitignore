@@ -1,0 +1,5 @@
+/.venv/
+/.venv-glmm/
+__pycache__/
+/cleaned_data.csv
+/glmm_posterior.nc

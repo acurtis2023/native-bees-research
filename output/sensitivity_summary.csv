@@ -1,0 +1,6 @@
+scenario,n_obs,n_vol,or_2,lo_2,hi_2,or_3plus,lo_3plus,hi_3plus,p_training
+Main model,3369,86,1.055,0.715,1.558,1.251,0.755,2.073,0.688
+Without top volunteer (216),2777,85,1.034,0.702,1.523,1.123,0.677,1.863,0.905
+Without training-flip volunteers,3355,84,1.086,0.734,1.609,1.278,0.768,2.128,0.644
+Bees only (no fly/wasp true IDs),3114,85,1.051,0.684,1.615,0.968,0.541,1.73,0.951
+Species as fixed effect,3369,86,1.048,0.71,1.548,1.246,0.753,2.063,0.693

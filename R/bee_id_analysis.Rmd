@@ -1,0 +1,505 @@
+---
+title: "Volunteer species identification: does training improve accuracy?"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = TRUE)
+knitr::opts_knit$set(root.dir = "/Users/aubreecurtis/Research/species-volunteer-glmm")
+```
+
+```{r packages}
+library(readxl)
+library(dplyr)
+library(stringr)
+library(purrr)
+library(readr)
+library(glmmTMB)
+library(emmeans)
+library(DHARMa)
+library(geepack)
+library(ggplot2)
+library(yaml)
+library(rmarkdown)
+
+dir.create("output", showWarnings = FALSE)
+```
+
+```{r settings}
+path          <- "data/VolunteerObservations.xlsx" 
+MIN_SPECIES_N <- 30   # rarer true species are pooled into "Other"
+```
+
+# 1. Read the data
+
+Everything is read as text, because `correctid` and `morphacc` mix numbers (the 9s) and words.
+
+```{r read}
+raw <- read_excel(path, col_types = "text")
+
+df <- raw |>
+  mutate(across(c(obs, year, vid, vtrain), as.integer),
+         across(c(mg, surveyid, correctid, morphacc), str_trim))
+
+nrow(df); n_distinct(df$vid)
+
+# 3621 observations, 86 distinct volunteers
+```
+
+# 2. Volunteer experience
+
+How many observations each volunteer had submitted before each one. This is computed on **all** rows, before any exclusions, because an observation that is later excluded still counts as experience. Observation numbers overlap slightly between 2024 and 2025, so rows are ordered by year first, then observation number.
+
+```{r experience}
+df <- df |>
+  arrange(vid, year, obs) |>
+  group_by(vid) |>
+  mutate(n_prior = row_number() - 1L,   # earlier observations by this volunteer
+         total_n = n()) |>              # volunteer's total observations
+  ungroup()
+
+summary(df$total_n)
+
+# per volunteer: median 13, mean 42, range 1 to 604
+```
+
+# 3. Standardize species labels
+
+Spelling variants are mapped to one name. Anything not recognized becomes `UNRECOGNIZED` and is excluded below.
+
+```{r labels}
+canon <- c(
+  bumblebees = "BumbleBees",   bumblebee = "BumbleBees",
+  honeybees = "HoneyBees",
+  stripedsweatbees = "StripedSweatBees",
+  tinydarkbees = "TinyDarkBees", tinydarkbeess = "TinyDarkBees",
+  hairybellybees = "HairyBellyBees",
+  hairylegbees = "HairyLegBees",
+  greenmetallicbees = "GreenMetallicBees",
+  syrphidflies = "SyrphidFlies",
+  beeflies = "BeeFlies",
+  wasps = "Wasps",             wasp = "Wasps",
+  cuckoobees = "CuckooBees",
+  flies = "Flies"              # a fly that isn't a named fly category
+)
+
+# "HoneyBees, BumbleBees" -> the set c("BumbleBees", "HoneyBees")
+parse_ids <- function(x) {
+  key <- str_to_lower(str_remove_all(x, "\\s"))
+  if (key == "honeybeestinydarkbees") {          # missing comma in the source
+    return(c("HoneyBees", "TinyDarkBees"))
+  }
+  out <- unname(canon[str_split(key, ",")[[1]]])
+  out[is.na(out)] <- "UNRECOGNIZED"
+  sort(unique(out))
+}
+
+survey_sets <- map(df$surveyid, parse_ids)
+true_sets   <- map(df$correctid, parse_ids)
+
+df <- df |>
+  mutate(
+    n_survey     = lengths(survey_sets),
+    n_true       = lengths(true_sets),
+    same_set     = map2_lgl(survey_sets, true_sets, setequal),
+    unrecognized = map_lgl(survey_sets, ~ "UNRECOGNIZED" %in% .x) |
+                   map_lgl(true_sets,   ~ "UNRECOGNIZED" %in% .x),
+    true_species = if_else(n_true == 1, map_chr(true_sets, 1), "Multiple")
+  )
+```
+
+# 4. Master gardener consistency
+
+A single change within a year (No to Yes) can be real. Status that flips back and forth cannot be, so in those volunteer-years the minority-value rows are treated as errors.
+
+```{r mg-check}
+df <- df |>
+  arrange(obs) |>
+  group_by(vid, year) |>
+  mutate(mg_changes  = sum(mg != lag(mg), na.rm = TRUE),
+         mg_modal    = names(which.max(table(mg))),
+         mg_conflict = mg_changes > 1 & mg != mg_modal) |>
+  ungroup()
+
+df |> filter(mg_conflict) |> select(obs, vid, year, mg)
+```
+
+# 5. Exclusions
+
+Each row gets at most one reason (first match wins). The 9s are excluded by team decision; the other rules drop rows whose scoring is uncertain.
+
+```{r exclusions}
+df <- df |>
+  mutate(exclude_reason = case_when(
+    correctid == "9" | morphacc == "9"   ~ "Unknown true ID (9)",
+    unrecognized                          ~ "Unrecognized label",
+    str_detect(str_to_lower(str_remove_all(correctid, "\\s")), "(^|,)flies(,|$)") ~ "True ID includes 'Flies' (scoring unresolved)",
+    morphacc == "Yes" & !same_set         ~ "Scored Yes but species differ",
+    morphacc == "No"  & same_set          ~ "Scored No but IDs match",
+    n_true > 1 & n_survey == 1            ~ "Multi-species true ID, single-species answer",
+    mg_conflict                           ~ "Master gardener status flips back and forth within year",
+    TRUE                                  ~ NA_character_
+  ))
+
+excluded <- df |>
+  filter(!is.na(exclude_reason)) |>
+  select(obs, year, vid, vtrain, mg, surveyid, correctid, morphacc, exclude_reason)
+write_csv(excluded, "output/excluded_rows.csv")
+
+cat("Rows read:", nrow(df), "\n")
+count(excluded, exclude_reason, sort = TRUE)
+```
+
+Share of rows excluded, by training level:
+
+```{r excluded-by-training}
+df |> group_by(vtrain) |>
+  summarise(n = n(), excluded = sum(!is.na(exclude_reason)),
+            pct_excluded = round(100 * excluded / n, 1))
+```
+
+# 6. Analysis set
+
+```{r analysis-set}
+dat <- df |>
+  filter(is.na(exclude_reason)) |>
+  mutate(
+    y               = as.integer(morphacc == "Yes"),
+    training        = factor(vtrain, levels = 1:3, labels = c("1", "2", "3+")),
+    year            = factor(year),
+    master_gardener = as.integer(mg == "Yes"),
+    log2_prior      = log2(n_prior + 1),  # +1 here = one doubling of prior observations
+    log2_total      = log2(total_n),
+    vid             = factor(vid)
+  )
+
+rare <- dat |> count(true_species) |>
+  filter(n < MIN_SPECIES_N, true_species != "Multiple") |> pull(true_species)
+dat <- dat |>
+  mutate(true_species = factor(if_else(true_species %in% rare, "Other", true_species)))
+
+cat("Analysis set:", nrow(dat), "rows,", n_distinct(dat$vid), "volunteers\n")
+write_csv(dat, "output/bee_id_clean.csv")
+```
+
+Accuracy by training level and by species:
+
+```{r descriptives}
+dat |> group_by(training) |>
+  summarise(n = n(), volunteers = n_distinct(vid), accuracy = round(mean(y), 3))
+
+dat |> group_by(true_species) |>
+  summarise(n = n(), accuracy = round(mean(y), 3)) |> arrange(desc(n))
+```
+
+# 7. Main model
+
+A logistic mixed model: each volunteer and each species gets its own baseline accuracy, and the model estimates the effect of training, master gardener status, and year on top of those.
+
+```{r main-model}
+m <- glmmTMB(
+  y ~ training + master_gardener + year + (1 | vid) + (1 | true_species),
+  data = dat, family = binomial
+)
+summary(m)
+
+# master gardener is borderline significant, which may suggest that master gardeners are slightly less accurate than non-master gardeners, but the effect is small
+# year2024 and year2025 are significant at p < 0.01, which may suggest that accuracy is improving over time
+```
+
+Overall test of training (both levels together), and predicted accuracy by level. The predicted values describe a typical volunteer and species, so they are not overall accuracy.
+
+```{r main-tests}
+m0 <- glmmTMB(y ~ master_gardener + year + (1 | vid) + (1 | true_species),
+              data = dat, family = binomial)
+anova(m0, m)
+
+# training overall: chi square = 0.75 on 2 df, p = 0.687. 
+# the model without training has the lower AIC, so adding training does not improve the model fit.
+
+emmeans(m, "training", type = "response")
+pairs(emmeans(m, "training"), type = "response")   # odds ratios between levels
+
+# predicted accuracy: 82.3%, 83.1%, 85.4% for training levels 1, 2, 3+ respectively. odds ratios do not differ significantly from 1.0
+```
+
+# 8. Diagnostics
+
+Simulated residuals check whether the model reproduces the patterns in the data. A p-value below 0.05 on a test suggests a problem.
+
+```{r diagnostics}
+sim <- simulateResiduals(m, n = 1000)
+plot(sim)
+
+# unremarkable, simulated residuals are roughly uniform and centered at 0.5. no obvious patterns in res vs pred plot; model fits well.
+```
+
+```{r diagnostics-tests}
+
+# standard tests for glmms, simulation-based residuals are used to check for uniformity, dispersion, and categorical effects
+testUniformity(sim, plot = FALSE)
+testDispersion(sim, plot = FALSE)
+testCategorical(sim, dat$true_species)
+testCategorical(sim, dat$training)
+
+# uniformity, dispersion, and categorical tests all have p-values substantially above 0.05. this persists across species and training levels
+# caveat: not significant doesn't prove a good fit; small groups (wasps, BeeFlies, etc.) have little power to show a problem even if one exists.
+```
+
+# 9. Sensitivity analyses
+
+The model is refit under several alternative choices to see whether the training result depends on any of them.
+
+```{r sensitivity-helper}
+# Returns the training odds ratios (vs. level 1) with Wald 95% CIs and the
+# likelihood-ratio p-value for training.
+fit_scenario <- function(d, label,
+                         fixed  = "training + master_gardener + year",
+                         random = "(1 | vid) + (1 | true_species)") {
+  d <- droplevels(d)
+  f_full <- as.formula(paste("y ~", fixed, "+", random))
+  f_null <- as.formula(paste("y ~", sub("^training \\+ ", "", fixed), "+", random))
+
+  mf <- glmmTMB(f_full, data = d, family = binomial)
+  mn <- glmmTMB(f_null, data = d, family = binomial)
+  cf <- summary(mf)$coefficients$cond
+  p_lrt <- anova(mn, mf)[["Pr(>Chisq)"]][2]
+
+  or_ci <- function(term) {
+    est <- cf[term, "Estimate"]; se <- cf[term, "Std. Error"]
+    c(exp(est), exp(est - 1.96 * se), exp(est + 1.96 * se))
+  }
+  a <- or_ci("training2"); b <- or_ci("training3+")
+
+  tibble(scenario = label, n_obs = nrow(d), n_vol = n_distinct(d$vid),
+         or_2 = a[1], lo_2 = a[2], hi_2 = a[3],
+         or_3plus = b[1], lo_3plus = b[2], hi_3plus = b[3],
+         p_training = p_lrt)
+}
+```
+
+```{r sensitivity-inputs}
+top_vid <- names(which.max(table(dat$vid)))          # volunteer with the most rows
+flip_vids <- dat |>                                   # training differs within a year
+  group_by(vid, year) |>
+  summarise(k = n_distinct(training), .groups = "drop") |>
+  filter(k > 1) |>
+  pull(vid) |> as.character() |> unique()
+bee_only <- dat |>                                    # drop fly and wasp true IDs
+  filter(!str_detect(str_to_lower(correctid), "fly|flies|wasp"))
+
+cat("Top volunteer:", top_vid, "(", sum(dat$vid == top_vid), "rows )\n")
+cat("Training-flip volunteers:", paste(flip_vids, collapse = ", "),
+    "(", sum(dat$vid %in% flip_vids), "rows )\n")
+cat("Rows dropped for bees-only:", nrow(dat) - nrow(bee_only), "\n")
+```
+
+```{r sensitivity-fits}
+results <- bind_rows(
+  fit_scenario(dat, "Main model"),
+  fit_scenario(filter(dat, vid != top_vid),
+               paste0("Without top volunteer (", top_vid, ")")),
+  fit_scenario(filter(dat, !vid %in% flip_vids),
+               "Without training-flip volunteers"),
+  fit_scenario(bee_only, "Bees only (no fly/wasp true IDs)"),
+  fit_scenario(dat, "Species as fixed effect",
+               fixed  = "training + master_gardener + year + true_species",
+               random = "(1 | vid)")
+) |>
+  mutate(across(where(is.numeric), ~ round(.x, 3)))
+
+write_csv(results, "output/sensitivity_summary.csv")
+as.data.frame(results)
+
+# 
+```
+
+# 10. GEE cross-check
+
+A simpler population-averaged model with cluster-robust standard errors. GEE has no random effects, so species enters as a fixed effect.
+
+```{r gee}
+d_gee <- dat |> arrange(vid)     # geeglm needs rows sorted by cluster
+
+gee_full <- geeglm(y ~ training + master_gardener + year + true_species,
+                   id = vid, data = d_gee, family = binomial,
+                   corstr = "exchangeable")
+gee_null <- geeglm(y ~ master_gardener + year + true_species,
+                   id = vid, data = d_gee, family = binomial,
+                   corstr = "exchangeable")
+
+cf <- summary(gee_full)$coefficients
+gee_tab <- data.frame(term = rownames(cf),
+                      OR = exp(cf$Estimate),
+                      lo = exp(cf$Estimate - 1.96 * cf$Std.err),
+                      hi = exp(cf$Estimate + 1.96 * cf$Std.err),
+                      p  = cf[["Pr(>|W|)"]])
+gee_tab[, 2:5] <- round(gee_tab[, 2:5], 3)
+write_csv(gee_tab, "output/gee_summary.csv")
+gee_tab
+```
+
+Wald test for training (both levels together):
+
+```{r gee-test}
+anova(gee_null, gee_full)
+```
+
+# 11. Does a volunteer's number of observations relate to accuracy?
+
+Two different questions:
+
+- **Learning curve (within a person):** does accuracy rise as a volunteer submits more observations? (`log2_prior`)
+- **Prolific vs. occasional volunteers (between people):** are volunteers who submit more overall more accurate? (`log2_total`)
+
+Both are on a log2 scale, so each odds ratio is **per doubling** of observations.
+
+```{r exp-descriptives}
+bins <- c(-1, 4, 19, 49, 99, 199, Inf)
+labs <- c("0-4", "5-19", "20-49", "50-99", "100-199", "200+")
+
+# Mixes within-person learning with differences between people, and few volunteers contribute to the highest bins.
+dat |>
+  mutate(prior_bin = cut(n_prior, breaks = bins, labels = labs)) |>
+  group_by(prior_bin) |>
+  summarise(n = n(), volunteers = n_distinct(vid),
+            accuracy = round(mean(y), 3))
+
+  # accuracy trends updwards with more prior observations, but the highest bin has few volunteers 
+  # adding experience to the model moves the training estimates toward no effect.
+  # i.e. the data can't fully separate "volunteers learn as they go" from "volunteers who keep submitting are better"
+
+  # tl;dr: each doubling of earlier observations raises the odds of a correct ID by about 15% (odds ratio ~ 1.15).
+```
+
+```{r exp-models}
+f_base  <- y ~ training + master_gardener + year + (1 | vid) + (1 | true_species)
+f_learn <- y ~ training + master_gardener + year + log2_prior + (1 | vid) + (1 | true_species)
+f_total <- y ~ training + master_gardener + year + log2_total + (1 | vid) + (1 | true_species)
+f_both  <- y ~ training + master_gardener + year + log2_prior + log2_total +
+             (1 | vid) + (1 | true_species)
+
+m_base  <- glmmTMB(f_base,  data = dat, family = binomial)
+m_learn <- glmmTMB(f_learn, data = dat, family = binomial)
+m_total <- glmmTMB(f_total, data = dat, family = binomial)
+m_both  <- glmmTMB(f_both,  data = dat, family = binomial)
+
+AIC(m_base, m_learn, m_total, m_both)   # lower = better fit
+
+# both terms (log2_prior and log2_total) improve the model fit with an AIC of 1964.4 and 1965.5 vs 1972.1 without either.
+
+```
+
+Likelihood-ratio tests:
+
+```{r exp-tests}
+cat("Learning curve (adds log2_prior):\n");      anova(m_base, m_learn)
+cat("Prolific volunteers (adds log2_total):\n"); anova(m_base, m_total)
+cat("Learning, after allowing for total:\n");    anova(m_total, m_both)
+```
+
+Odds ratios. The training rows show whether the training estimate changes once experience is accounted for.
+
+```{r exp-odds}
+or_row <- function(mod, term, label) {
+  cf  <- summary(mod)$coefficients$cond
+  est <- cf[term, "Estimate"]; se <- cf[term, "Std. Error"]
+  tibble(model = label, term = term,
+         odds_ratio = exp(est), lo = exp(est - 1.96 * se), hi = exp(est + 1.96 * se),
+         p = cf[term, "Pr(>|z|)"])
+}
+
+exp_results <- bind_rows(
+  or_row(m_learn, "log2_prior", "Learning curve"),
+  or_row(m_total, "log2_total", "Prolific volunteers"),
+  or_row(m_both,  "log2_prior", "Both in model"),
+  or_row(m_both,  "log2_total", "Both in model"),
+  or_row(m_base,  "training3+", "Training 3+ vs 1 (no experience term)"),
+  or_row(m_learn, "training3+", "Training 3+ vs 1 (with learning curve)"),
+  or_row(m_both,  "training3+", "Training 3+ vs 1 (with both)"),
+  or_row(m_base,  "training2",  "Training 2 vs 1 (no experience term)"),
+  or_row(m_learn, "training2",  "Training 2 vs 1 (with learning curve)"),
+  or_row(m_both,  "training2",  "Training 2 vs 1 (with both)")
+) |> mutate(across(where(is.numeric), ~ round(.x, 3)))
+
+write_csv(exp_results, "output/experience_summary.csv")
+as.data.frame(exp_results)
+
+# learning curve: odds ratio = 1.15 (95% CI: 1.06-1.25), p = 0.001
+# prolific volunteers: odds ratio = 1.21 (95% CI: 1.07-1.36), p = 0.002
+
+# the slight gain for level 3+ training disappears once experience was accounted for; essentially, the slight benefit of training disappears when experience is in the model. 
+# this isn't necessarily meaningful, because the training levels are confounded with experience. 
+```
+
+Predicted accuracy by earlier observations. Read the **shape** of the curve: the level describes a typical volunteer and species, not overall accuracy.
+
+```{r exp-predictions}
+at_vals <- c(0, 4, 9, 19, 49, 99, 199, 399)   # earlier observations
+
+pred <- emmeans(m_learn, ~ log2_prior,
+                at = list(log2_prior = log2(at_vals + 1)), type = "response") |>
+  as.data.frame() |>
+  mutate(prior_obs = round(2^log2_prior - 1))
+
+pred |> select(prior_obs, prob, asymp.LCL, asymp.UCL) |>
+  mutate(across(where(is.numeric), ~ round(.x, 3)))
+```
+
+```{r exp-plot}
+obs_bins <- dat |>
+  mutate(prior_bin = cut(n_prior, breaks = bins, labels = labs)) |>
+  group_by(prior_bin) |>
+  summarise(mid = median(n_prior), acc = mean(y), n = n(), .groups = "drop")
+
+brks <- c(0, 5, 20, 50, 100, 200, 400)
+p <- ggplot(pred, aes(log2_prior, prob)) +
+  geom_ribbon(aes(ymin = asymp.LCL, ymax = asymp.UCL), alpha = 0.2) +
+  geom_line() +
+  geom_point(data = obs_bins, aes(log2(mid + 1), acc, size = n), inherit.aes = FALSE) +
+  scale_x_continuous(breaks = log2(brks + 1), labels = brks) +
+  labs(x = "Earlier observations by the volunteer (log scale)",
+       y = "Probability of a correct ID",
+       size = "Observations\nin bin",
+       title = "Accuracy vs. volunteer experience",
+       subtitle = "Line: model for a typical volunteer and species. Points: observed accuracy by bin.") +
+  theme_minimal()
+
+ggsave("output/experience_curve.png", p, width = 7.5, height = 4.8, dpi = 200)
+p
+```
+
+Robustness: the learning-curve effect without the volunteer who contributes the most rows.
+
+```{r exp-notop}
+m_learn_notop <- glmmTMB(f_learn, data = filter(dat, vid != top_vid), family = binomial)
+or_row(m_learn_notop, "log2_prior", "Without top volunteer") |>
+  mutate(across(where(is.numeric), ~ round(.x, 3)))
+
+# learning curve effect is still present without the top volunteer: odds ratio = 1.14 (95% CI: 1.04-1.24), p = 0.003
+```
+
+Exploratory: do volunteers differ in how fast they improve (a random slope for experience)? This can fail to converge with few observations per volunteer, which is informative in itself.
+
+```{r exp-slope}
+m_slope <- try(
+  glmmTMB(y ~ training + master_gardener + year + log2_prior +
+            (1 + log2_prior | vid) + (1 | true_species),
+          data = dat, family = binomial),
+  silent = TRUE)
+
+if (inherits(m_slope, "try-error")) {
+  cat("The random-slope model did not fit; skip it.\n")
+} else if (!isTRUE(m_slope$sdr$pdHess)) {
+  cat("The random-slope model fit but did not converge cleanly; do not interpret it.\n")
+} else {
+  print(VarCorr(m_slope))
+  anova(m_learn, m_slope)
+}
+
+# model converges; volunteer-to-volunteer variation in learning curve is small, and allowing it doesn't improve the fit. 
+# aka no evidence that volunteers differ in how fast they improve.
+```

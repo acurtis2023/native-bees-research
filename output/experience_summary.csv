@@ -1,0 +1,11 @@
+model,term,odds_ratio,lo,hi,p
+Learning curve,log2_prior,1.15,1.058,1.25,0.001
+Prolific volunteers,log2_total,1.208,1.071,1.363,0.002
+Both in model,log2_prior,1.099,0.989,1.222,0.079
+Both in model,log2_total,1.111,0.956,1.292,0.169
+Training 3+ vs 1 (no experience term),training3+,1.251,0.755,2.073,0.385
+Training 3+ vs 1 (with learning curve),training3+,1.065,0.666,1.701,0.794
+Training 3+ vs 1 (with both),training3+,1.008,0.627,1.62,0.974
+Training 2 vs 1 (no experience term),training2,1.055,0.715,1.558,0.786
+Training 2 vs 1 (with learning curve),training2,0.929,0.634,1.361,0.704
+Training 2 vs 1 (with both),training2,0.946,0.646,1.386,0.776
